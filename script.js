@@ -1,12 +1,14 @@
-const API_KEY = "";
+// const API_KEY = "your_api_key";
 
 const state = {
     currentAudioObject: null,
     audioQueue: [],
-    sPlaying: false,
-}
+    isPlaying: false,
+    llmAbortController: null,
+};
 
 async function* llmStreaming(userText = '') {
+     state.llmAbortController = new AbortController();
    
     const response = await fetch('https://api.openai.com/v1/responses', {
         method: 'POST',
@@ -14,6 +16,7 @@ async function* llmStreaming(userText = '') {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${API_KEY}`,
         },
+        signal: state.llmAbortController.signal,   //add this line for barge-in
         body: JSON.stringify({
             model: 'gpt-5.6-luna',
             input:` you are a part of Speech to Text and Text to Speech pipeline.
@@ -21,6 +24,7 @@ async function* llmStreaming(userText = '') {
             User Query: ${userText}
             `,
             stream: true,
+            
         }),
     });
 
@@ -35,7 +39,7 @@ async function* llmStreaming(userText = '') {
     let rest = text;
 
     while (true) {
-        const end = rest.search(/[.?]/);
+        const end = rest.search(/[.!?]/);
         if (end === -1) break;
         const sentence = rest.slice(0, end + 1).trim();
         rest = rest.slice(end + 1);
@@ -61,34 +65,38 @@ async function* llmStreaming(userText = '') {
                 .join('\n');
 
             if (!payload || payload === '[DONE]') continue;
+
             const parsed = JSON.parse(payload);
 
             if (parsed.type === 'response.output_text.delta') {
                 textContent += parsed.delta;
                 sentenceBuffer += parsed.delta;
+
                 const { sentences, rest } = takeSentences(sentenceBuffer);
                 sentenceBuffer = rest;
+
                 for (const sentence of sentences) {
                     yield {
                         textContent,
                         isFinal: false,
                         delta: sentence,
                     };
+                }
             }
-        }
 
-        if (parsed.type === 'response.output_text.done') {
-            textContent = parsed.text ?? textContent;
+            if (parsed.type === 'response.output_text.done') {
+                textContent = parsed.text ?? textContent;
 
-        if (sentenceBuffer.trim()) {
-            yield {
-                textContent,
-                isFinal: true,
-                delta: sentenceBuffer.trim(),
-                };
-                sentenceBuffer = '';
+                if (sentenceBuffer.trim()) {
+                    yield {
+                        textContent,
+                        isFinal: true,
+                        delta: sentenceBuffer.trim(),
+                    };
+
+                    sentenceBuffer = '';
+                }
             }
-        }
         }
     }
 }
@@ -235,41 +243,85 @@ async function main() {
     const speechRecognition = new SpeechRecognition();
 
     speechRecognition.continuous = true;
-    speechRecognition.interimResults = false; //give result when the user stop
+    speechRecognition.interimResults = true; //give result when the user stop
     speechRecognition.maxAlternatives = 1;
 
     speechRecognition.onstart = function() {
         console.log("🎤SpeechRecognition has started");
     };
+    function bargeIn() {
+    // Stop current audio
+    if (state.currentAudioObject) {
+        const { audio, audioUrl, resolve } = state.currentAudioObject;
+
+        audio.onended = null;
+        audio.onerror = null;
+
+        audio.pause();
+        audio.currentTime = 0;
+        audio.src = '';
+
+        if (audioUrl) {
+            URL.revokeObjectURL(audioUrl);
+        }
+        state.currentAudioObject = null;
+        resolve?.();
+    }
+    // Clear waiting audio
+    state.audioQueue = [];
+
+    // Cancel previous LLM stream
+    if (state.llmAbortController) {
+        state.llmAbortController.abort();
+        state.llmAbortController = null;
+    }
+
+    console.log('🛑 Barge-in: Agent interrupted');
+}
     
     speechRecognition.onresult = async function (event) {
-        const transcript = event.results[event.results.length -1][0].transcript;
-        console.log('User:', transcript);
+        const result = event.results[event.results.length - 1];
+        const transcript = result[0].transcript.trim();
 
+        const isAgentPlaying = !!state.currentAudioObject || state.audioQueue.length > 0;
 
-       if(state.currentAudioObject){
-    const { audio, audioUrl, resolve } = state.currentAudioObject;
-
-    audio.onended = null;
-    audio.onerror = null;
-    audio.pause();
-    audio.src = '';
-    URL.revokeObjectURL(audioUrl);
-    state.currentAudioObject = null;
-    resolve?.();
-}
-
-if(state.audioQueue.length > 0){
-    state.audioQueue = [];
-}
-             
-    
-        for await (const chunk of llmStreaming(transcript)) {
-            if (!chunk.delta) continue; //add this line
-            console.log('Agent chunk:', chunk.delta);
-             await speak(chunk.delta);
+        if (transcript && !result.isFinal && isAgentPlaying) {
+            bargeIn();
+            return;
         }
-        
+
+        if (!result.isFinal || !transcript) return;
+
+        if (state.currentAudioObject) {
+            const { audio, audioUrl, resolve } = state.currentAudioObject;
+
+            audio.onended = null;
+            audio.onerror = null;
+            audio.pause();
+            audio.src = '';
+            URL.revokeObjectURL(audioUrl);
+            state.currentAudioObject = null;
+            resolve?.();
+        }
+
+        if (state.audioQueue.length > 0) {
+            state.audioQueue = [];
+        }
+
+        try {
+            for await (const chunk of llmStreaming(transcript)) {
+                if (!chunk?.delta) continue;
+                console.log('Agent chunk:', chunk.delta);
+                await speak(chunk.delta);
+            }
+        } catch (error) {
+            if (error?.name === 'AbortError') {
+                console.log('LLM request aborted due to barge-in');
+                return;
+            }
+
+            console.error('LLM streaming error:', error);
+        }
     };
     speechRecognition.start();
 }
